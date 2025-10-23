@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PhotoFilter Pro</title>
+    <link rel="stylesheet" href="styles.css">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Poppins:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+</head>
+<body>
+    <!-- Login Screen -->
+    <div id="loginScreen" class="screen active">
+        <div class="login-container">
+            <div class="login-card">
+                <div class="logo">
+                    <i class="fas fa-camera-retro"></i>
+                    <h1>PhotoFilter Pro</h1>
+                    <p class="api-badge">REST API Version</p>
+                </div>
+                <form id="loginForm" class="login-form">
+                    <div class="input-group">
+                        <i class="fas fa-user"></i>
+                        <input type="text" id="username" placeholder="Username" required>
+                    </div>
+                    <div class="input-group">
+                        <i class="fas fa-lock"></i>
+                        <input type="password" id="password" placeholder="Password" required>
+                    </div>
+                    <button type="submit" class="login-btn">
+                        <i class="fas fa-sign-in-alt"></i>
+                        Login
+                    </button>
+                </form>
+                <div class="demo-credentials">
+                    <p>Welcome to PhotoFilter Pro</p>
+                    <p>Edit on the GO</p>
+                    <p><a href="#" id="showRegister" class="register-link">Don't have an account? Register here</a></p>
+                </div>
+                
+                <!-- Registration Form -->
+                <div id="registerForm" class="login-form" style="display: none;">
+                    <h2>Create Account</h2>
+                    <form id="registrationForm">
+                        <div class="form-group">
+                            <i class="fas fa-user"></i>
+                            <input type="text" id="regUsername" placeholder="Username" required>
+                        </div>
+                        <div class="form-group">
+                            <i class="fas fa-envelope"></i>
+                            <input type="email" id="regEmail" placeholder="Email" required>
+                        </div>
+                        <div class="form-group">
+                            <i class="fas fa-lock"></i>
+                            <input type="password" id="regPassword" placeholder="Password" required>
+                        </div>
+                        <button type="submit" class="login-btn">
+                            <i class="fas fa-user-plus"></i>
+                            Create Account
+                        </button>
+                    </form>
+                    <p><a href="#" id="showLogin" class="register-link">Already have an account? Login here</a></p>
+                </div>
+                <!-- Email Verification Section -->
+                <div id="emailVerificationSection" class="verification-section" style="display: none;">
+                    <div class="verification-content">
+                        <div class="verification-icon">
+                            <i class="fas fa-envelope-open"></i>
+                        </div>
+                        <h2>Check Your Email</h2>
+                        <p>We've sent a verification link to your email address.</p>
+                        <p>Please click the link in the email to verify your account and complete registration.</p>
+                        <div class="verification-actions">
+                            <button id="resendVerificationBtn" class="btn-secondary">
+                                <i class="fas fa-redo"></i>
+                                Resend Verification Email
+                            </button>
+                            <button id="backToLoginBtn" class="btn-secondary">
+                                <i class="fas fa-arrow-left"></i>
+                                Back to Login
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Main App Screen -->
+    <div id="appScreen" class="screen">
+        <header class="app-header">
+            <div class="header-content">
+                <div class="logo-small">
+                    <i class="fas fa-camera-retro"></i>
+                    <span>PhotoFilter Pro</span>
+                </div>
+                <div class="user-info">
+                    <span id="welcomeUser">Welcome, User!</span>
+                    <button id="logoutBtn" class="logout-btn">
+                        <i class="fas fa-sign-out-alt"></i>
+                        Logout
+                    </button>
+                </div>
+            </div>
+        </header>
+
+        <main class="app-main">
+            <div class="upload-section">
+                <div class="upload-area" id="uploadArea">
+                    <div class="upload-content">
+                        <i class="fas fa-cloud-upload-alt"></i>
+                        <h3>Upload Photo</h3>
+                        <p>Drag & drop or click to select</p>
+                        <input type="file" id="fileInput" accept="image/*" hidden>
+                        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                            Choose File
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="camera-section">
+                    <button id="cameraBtn" class="camera-btn">
+                        <i class="fas fa-camera"></i>
+                        Take Photo
+                    </button>
+                    <video id="video" autoplay muted hidden></video>
+                    <canvas id="canvas" hidden></canvas>
+                </div>
+            </div>
+
+            <div class="photo-editor" id="photoEditor" style="display: none;">
+                <div class="processing-section" id="processingSection">
+                    <div class="processing-content">
+                        <i class="fas fa-magic"></i>
+                        <h3>Processing Image...</h3>
+                        <p>Uploading to server and applying filters</p>
+                        <div class="loading-spinner">
+                            <div class="spinner"></div>
+                        </div>
+                        <div class="progress-info" id="progressInfo">
+                            <p>Step 1: Uploading image...</p>
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="results-section" id="resultsSection" style="display: none;">
+                    <h3 class="results-title">Choose Your Favorite Filter</h3>
+                    <div class="results-grid" id="resultsGrid">
+                        <!-- Results will be populated by JavaScript -->
+                    </div>
+                    
+                    <div class="action-buttons">
+                        <button id="downloadBtn" class="action-btn download" disabled>
+                            <i class="fas fa-download"></i>
+                            Download Selected
+                        </button>
+                        <button id="newPhotoBtn" class="action-btn new">
+                            <i class="fas fa-plus"></i>
+                            New Photo
+                        </button>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script src="api-script.js"></script>
+</body>
+</html>
