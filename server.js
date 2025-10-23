@@ -456,7 +456,7 @@ app.get('/api/verify-email', async (req, res) => {
         userToVerify.emailVerificationToken = null;
 
         // Generate tokens for the verified user
-        const token = jwt.sign(
+        const accessToken = jwt.sign(
             { id: userToVerify.id, username: userToVerify.username },
             JWT_SECRET,
             { expiresIn: JWT_EXPIRES_IN }
@@ -474,7 +474,7 @@ app.get('/api/verify-email', async (req, res) => {
         res.json({
             success: true,
             message: 'Email verified successfully! You can now use all features.',
-            token,
+            token: accessToken,
             refreshToken,
             user: {
                 id: userToVerify.id,
