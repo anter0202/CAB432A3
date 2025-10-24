@@ -92,6 +92,9 @@ uploads/
 processed/
 *.log
 
+# AWS credentials (NEVER commit these!)
+.aws/
+
 # OS generated files
 .DS_Store
 .DS_Store?
