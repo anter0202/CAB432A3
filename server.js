@@ -1,3 +1,4 @@
+require('dotenv').config();
 const express = require('express');
 const multer = require('multer');
 const sharp = require('sharp');
@@ -8,6 +9,11 @@ const path = require('path');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const nodemailer = require('nodemailer');
+const userRepo = require('./dynamodb');
+const sqsHelper = require('./sqs');
+
+// Get SQS queue URL from environment
+const QUEUE_URL = process.env.SQS_QUEUE_URL;
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -31,26 +37,44 @@ const EMAIL_CONFIG = {
 const EMAIL_FROM = process.env.EMAIL_FROM || 'PhotoFilter Pro <noreply@photofilterpro.com>';
 const BASE_URL = process.env.BASE_URL || 'http://localhost:3000';
 
-// In-memory user store (in production, use a real database)
-const users = new Map();
-
 // Initialize default user
 const initializeDefaultUser = async () => {
-    const hashedPassword = await bcrypt.hash('kingkong', 10);
-    users.set('anter', {
-        id: 'anter',
-        username: 'anter',
-        password: hashedPassword,
-        email: 'anter@example.com',
-        createdAt: new Date().toISOString(),
-        refreshTokens: new Set(), // Store refresh tokens
-        emailVerified: true, // Default user is pre-verified
-        emailVerificationToken: null
-    });
-    console.log('✅ Default user "anter" initialized');
+    try {
+        // Check if default user already exists
+        const existingUser = await userRepo.getUserByUsername('anter');
+        if (existingUser) {
+            console.log('✅ Default user "anter" already exists in DynamoDB');
+            return;
+        }
+
+        const hashedPassword = await bcrypt.hash('kingkong', 10);
+        await userRepo.createUser({
+            id: 'anter',
+            username: 'anter',
+            password: hashedPassword,
+            email: 'anter@example.com',
+            createdAt: new Date().toISOString(),
+            refreshTokens: new Set(),
+            emailVerified: true,
+            emailVerificationToken: null
+        });
+        console.log('✅ Default user "anter" initialized in DynamoDB');
+    } catch (error) {
+        if (error.message === 'Username already exists') {
+            console.log('✅ Default user "anter" already exists in DynamoDB');
+        } else if (error.name === 'UnrecognizedClientException' || error.message.includes('security token')) {
+            console.error('❌ AWS session token has expired. Please refresh your AWS credentials in .aws/credentials');
+            console.error('   You need to get new temporary credentials from AWS.');
+        } else {
+            console.error('❌ Error initializing default user:', error.message);
+        }
+    }
 };
 
 // Middleware
+// Trust proxy for AWS ALB/API Gateway (needed for proper HTTPS handling)
+app.set('trust proxy', 1);
+
 app.use(cors());
 app.use(express.json());
 app.use(express.static('.')); // Serve current directory
@@ -110,8 +134,54 @@ const processedDir = path.join(__dirname, 'processed');
 fs.ensureDirSync(uploadsDir);
 fs.ensureDirSync(processedDir);
 
-// JWT Authentication Middleware
-const authenticateToken = (req, res, next) => {
+// Cognito Authentication (if configured)
+let cognito = null;
+try {
+    cognito = require('./cognito');
+} catch (error) {
+    // Cognito not configured - this is OK
+}
+
+// Cognito JWT Authentication Middleware (if Cognito is configured)
+const authenticateCognitoToken = async (req, res, next) => {
+    if (!cognito) {
+        return res.status(501).json({
+            success: false,
+            message: 'Cognito authentication not configured'
+        });
+    }
+
+    try {
+        const authHeader = req.headers['authorization'];
+        const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
+
+        if (!token) {
+            return res.status(401).json({
+                success: false,
+                message: 'Access token required'
+            });
+        }
+
+        // Verify Cognito ID token
+        const payload = await cognito.verifyToken(token);
+        req.user = {
+            id: payload.sub,
+            username: payload['cognito:username'] || payload.username,
+            email: payload.email,
+            emailVerified: payload.email_verified
+        };
+        next();
+    } catch (error) {
+        return res.status(403).json({
+            success: false,
+            message: 'Invalid or expired token',
+            error: error.message
+        });
+    }
+};
+
+// Unified Authentication Middleware - tries Cognito first, falls back to legacy JWT
+const authenticateToken = async (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1]; // Bearer TOKEN
 
@@ -122,11 +192,33 @@ const authenticateToken = (req, res, next) => {
         });
     }
 
+    // Try Cognito authentication first (if configured)
+    if (cognito) {
+        try {
+            const payload = await cognito.verifyToken(token);
+            req.user = {
+                id: payload.sub,
+                username: payload['cognito:username'] || payload.username,
+                email: payload.email,
+                emailVerified: payload.email_verified
+            };
+            return next();
+        } catch (cognitoError) {
+            // If Cognito verification fails (e.g., token is not a Cognito token), 
+            // silently fall back to legacy JWT authentication
+            // This is expected behavior when using legacy JWT tokens
+        }
+    }
+
+    // Try legacy JWT authentication
     jwt.verify(token, JWT_SECRET, (err, user) => {
         if (err) {
-            return res.status(403).json({
+            // Return 401 for expired tokens to allow refresh, 403 for invalid tokens
+            const statusCode = err.name === 'TokenExpiredError' ? 401 : 403;
+            return res.status(statusCode).json({
                 success: false,
-                message: 'Invalid or expired token'
+                message: err.name === 'TokenExpiredError' ? 'Token expired' : 'Invalid or expired token',
+                error: err.message
             });
         }
         req.user = user;
@@ -148,7 +240,8 @@ const storage = multer.diskStorage({
 const upload = multer({
     storage: storage,
     limits: {
-        fileSize: 10 * 1024 * 1024 // 10MB limit
+        fileSize: 10 * 1024 * 1024, // 10MB limit per file
+        files: 10 // Maximum 10 files for batch upload
     },
     fileFilter: (req, file, cb) => {
         if (file.mimetype.startsWith('image/')) {
@@ -178,9 +271,59 @@ const filters = {
 };
 
 // Filter processing functions
-const applyFilter = async (imagePath, filterName) => {
+const applyFilter = async (imagePath, filterName, customParams = null) => {
     let sharpInstance = sharp(imagePath);
     
+    // Handle custom filter parameters
+    if (customParams) {
+        const params = customParams;
+        
+        // Apply custom brightness if specified
+        if (params.brightness !== undefined) {
+            sharpInstance = sharpInstance.modulate({
+                brightness: Math.max(0.1, Math.min(3.0, params.brightness))
+            });
+        }
+        
+        // Apply custom saturation if specified
+        if (params.saturation !== undefined) {
+            sharpInstance = sharpInstance.modulate({
+                saturation: Math.max(0, Math.min(3.0, params.saturation))
+            });
+        }
+        
+        // Apply custom hue if specified
+        if (params.hue !== undefined) {
+            sharpInstance = sharpInstance.modulate({
+                hue: Math.max(-180, Math.min(180, params.hue))
+            });
+        }
+        
+        // Apply custom blur if specified
+        if (params.blur !== undefined) {
+            sharpInstance = sharpInstance.blur(Math.max(0, Math.min(100, params.blur)));
+        }
+        
+        // Apply custom contrast if specified
+        if (params.contrast !== undefined) {
+            const contrastValue = Math.max(0.5, Math.min(3.0, params.contrast));
+            sharpInstance = sharpInstance.linear(contrastValue, -(128 * (contrastValue - 1) / 2));
+        }
+        
+        // Apply grayscale if specified
+        if (params.grayscale === true) {
+            sharpInstance = sharpInstance.grayscale();
+        }
+        
+        // Apply invert if specified
+        if (params.invert === true) {
+            sharpInstance = sharpInstance.negate();
+        }
+        
+        return sharpInstance;
+    }
+    
+    // Standard filters
     switch (filterName) {
         case 'grayscale':
             sharpInstance = sharpInstance.grayscale();
@@ -266,9 +409,171 @@ const applyFilter = async (imagePath, filterName) => {
     return sharpInstance;
 };
 
+// Store custom filters per user (in-memory, could be moved to DynamoDB)
+const customFilters = new Map();
+
+// Store shared image tokens (in-memory, could be moved to DynamoDB or Redis)
+const sharedImages = new Map(); // token -> { imageId, filename, filterName, expiresAt, userId }
+
 // API Routes
 
-// Authentication endpoints
+// Cognito Authentication endpoints
+if (cognito) {
+    app.post('/api/cognito/signup', async (req, res) => {
+        try {
+            const { username, password, email } = req.body;
+
+            if (!username || !password || !email) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username, password, and email are required'
+                });
+            }
+
+            const result = await cognito.signUp(username, password, email);
+            res.status(201).json(result);
+        } catch (error) {
+            console.error('Cognito signup error:', error);
+            
+            let statusCode = 500;
+            let message = 'Registration failed';
+            
+            // Handle specific Cognito errors
+            if (error.name === 'UsernameExistsException') {
+                statusCode = 409;
+                message = 'Username already exists. Please choose a different username.';
+            } else if (error.name === 'InvalidPasswordException') {
+                statusCode = 400;
+                const errorMsg = error.message || '';
+                if (errorMsg.includes('not long enough')) {
+                    message = 'Password must be at least 8 characters long.';
+                } else if (errorMsg.includes('uppercase')) {
+                    message = 'Password must contain at least one uppercase letter.';
+                } else if (errorMsg.includes('lowercase')) {
+                    message = 'Password must contain at least one lowercase letter.';
+                } else if (errorMsg.includes('number')) {
+                    message = 'Password must contain at least one number.';
+                } else if (errorMsg.includes('symbol')) {
+                    message = 'Password must contain at least one symbol (!@#$%^&*).';
+                } else {
+                    message = 'Password does not meet requirements: Must be 8+ characters with at least 1 uppercase, 1 lowercase, 1 number, and 1 symbol.';
+                }
+            } else if (error.name === 'InvalidParameterException') {
+                statusCode = 400;
+                message = error.message || 'Invalid input. Please check your username, email, and password.';
+            } else {
+                message = error.message || 'Registration failed. Please try again.';
+            }
+            
+            res.status(statusCode).json({
+                success: false,
+                message: message,
+                error: error.message,
+                errorType: error.name
+            });
+        }
+    });
+
+    app.post('/api/cognito/confirm', async (req, res) => {
+        try {
+            const { username, confirmationCode } = req.body;
+
+            if (!username || !confirmationCode) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username and confirmation code are required'
+                });
+            }
+
+            const result = await cognito.confirmSignUp(username, confirmationCode);
+            res.json(result);
+        } catch (error) {
+            console.error('Cognito confirmation error:', error);
+            res.status(500).json({
+                success: false,
+                message: error.name === 'CodeMismatchException' ? 'Invalid confirmation code' : 'Confirmation failed',
+                error: error.message
+            });
+        }
+    });
+
+    app.post('/api/cognito/resend-code', async (req, res) => {
+        try {
+            const { username } = req.body;
+
+            if (!username) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username is required'
+                });
+            }
+
+            const result = await cognito.resendConfirmationCode(username);
+            res.json(result);
+        } catch (error) {
+            console.error('Cognito resend code error:', error);
+            res.status(500).json({
+                success: false,
+                message: 'Failed to resend confirmation code',
+                error: error.message
+            });
+        }
+    });
+
+    app.post('/api/cognito/login', async (req, res) => {
+        try {
+            const { username, password } = req.body;
+
+            if (!username || !password) {
+                return res.status(400).json({
+                    success: false,
+                    message: 'Username and password are required'
+                });
+            }
+
+            const result = await cognito.authenticate(username, password);
+            
+            // Decode ID token to get user info
+            const userInfo = cognito.decodeToken(result.idToken);
+
+            res.json({
+                success: true,
+                message: 'Login successful',
+                accessToken: result.accessToken,
+                idToken: result.idToken,
+                refreshToken: result.refreshToken,
+                expiresIn: result.expiresIn,
+                user: {
+                    id: userInfo.sub,
+                    username: userInfo['cognito:username'] || username,
+                    email: userInfo.email,
+                    emailVerified: userInfo.email_verified
+                }
+            });
+        } catch (error) {
+            console.error('Cognito login error:', error);
+            
+            let statusCode = 500;
+            let message = 'Login failed';
+
+            if (error.name === 'NotAuthorizedException') {
+                statusCode = 401;
+                message = 'Invalid username or password';
+            } else if (error.name === 'UserNotConfirmedException') {
+                statusCode = 403;
+                message = 'User email not confirmed. Please check your email for confirmation code.';
+            }
+
+            res.status(statusCode).json({
+                success: false,
+                message: message,
+                error: error.message
+            });
+        }
+    });
+}
+
+// Legacy Authentication endpoints (DynamoDB-based)
 app.post('/api/register', async (req, res) => {
     try {
         const { username, password, email } = req.body;
@@ -280,7 +585,9 @@ app.post('/api/register', async (req, res) => {
             });
         }
 
-        if (users.has(username)) {
+        // Check if user already exists
+        const existingUser = await userRepo.getUserByUsername(username);
+        if (existingUser) {
             return res.status(409).json({
                 success: false,
                 message: 'Username already exists'
@@ -290,7 +597,7 @@ app.post('/api/register', async (req, res) => {
         const hashedPassword = await bcrypt.hash(password, 10);
         const emailVerificationToken = uuidv4();
         
-        const user = {
+        const userData = {
             id: username,
             username,
             password: hashedPassword,
@@ -301,7 +608,8 @@ app.post('/api/register', async (req, res) => {
             emailVerificationToken: emailVerificationToken
         };
 
-        users.set(username, user);
+        // Create user in DynamoDB
+        await userRepo.createUser(userData);
 
         // Send verification email if email is provided
         let emailSent = false;
@@ -315,19 +623,19 @@ app.post('/api/register', async (req, res) => {
         
         if (!email || emailSent) {
             token = jwt.sign(
-                { id: user.id, username: user.username },
+                { id: userData.id, username: userData.username },
                 JWT_SECRET,
                 { expiresIn: JWT_EXPIRES_IN }
             );
 
             refreshToken = jwt.sign(
-                { id: user.id, username: user.username, type: 'refresh' },
+                { id: userData.id, username: userData.username, type: 'refresh' },
                 JWT_SECRET,
                 { expiresIn: REFRESH_TOKEN_EXPIRES_IN }
             );
 
-            // Store refresh token
-            user.refreshTokens.add(refreshToken);
+            // Store refresh token in DynamoDB
+            await userRepo.addRefreshToken(username, refreshToken);
         }
 
         res.status(201).json({
@@ -341,16 +649,22 @@ app.post('/api/register', async (req, res) => {
             emailVerificationRequired: !!email,
             emailSent,
             user: {
-                id: user.id,
-                username: user.username,
-                email: user.email,
-                emailVerified: user.emailVerified,
-                createdAt: user.createdAt
+                id: userData.id,
+                username: userData.username,
+                email: userData.email,
+                emailVerified: userData.emailVerified,
+                createdAt: userData.createdAt
             }
         });
 
     } catch (error) {
         console.error('Registration error:', error);
+        if (error.message === 'Username already exists') {
+            return res.status(409).json({
+                success: false,
+                message: 'Username already exists'
+            });
+        }
         res.status(500).json({
             success: false,
             message: 'Registration failed',
@@ -370,7 +684,7 @@ app.post('/api/login', async (req, res) => {
             });
         }
 
-        const user = users.get(username);
+        const user = await userRepo.getUserByUsername(username);
         if (!user) {
             return res.status(401).json({
                 success: false,
@@ -398,8 +712,8 @@ app.post('/api/login', async (req, res) => {
             { expiresIn: REFRESH_TOKEN_EXPIRES_IN }
         );
 
-        // Store refresh token
-        user.refreshTokens.add(refreshToken);
+        // Store refresh token in DynamoDB
+        await userRepo.addRefreshToken(username, refreshToken);
 
         res.json({
             success: true,
@@ -436,13 +750,7 @@ app.get('/api/verify-email', async (req, res) => {
         }
 
         // Find user by verification token
-        let userToVerify = null;
-        for (const [username, user] of users.entries()) {
-            if (user.emailVerificationToken === token) {
-                userToVerify = user;
-                break;
-            }
-        }
+        const userToVerify = await userRepo.getUserByVerificationToken(token);
 
         if (!userToVerify) {
             return res.status(404).json({
@@ -451,9 +759,11 @@ app.get('/api/verify-email', async (req, res) => {
             });
         }
 
-        // Mark email as verified
-        userToVerify.emailVerified = true;
-        userToVerify.emailVerificationToken = null;
+        // Mark email as verified and clear verification token
+        await userRepo.updateUser(userToVerify.username, {
+            emailVerified: true,
+            emailVerificationToken: null
+        });
 
         // Generate tokens for the verified user
         const accessToken = jwt.sign(
@@ -468,8 +778,8 @@ app.get('/api/verify-email', async (req, res) => {
             { expiresIn: REFRESH_TOKEN_EXPIRES_IN }
         );
 
-        // Store refresh token
-        userToVerify.refreshTokens.add(refreshToken);
+        // Store refresh token in DynamoDB
+        await userRepo.addRefreshToken(userToVerify.username, refreshToken);
 
         res.json({
             success: true,
@@ -480,7 +790,7 @@ app.get('/api/verify-email', async (req, res) => {
                 id: userToVerify.id,
                 username: userToVerify.username,
                 email: userToVerify.email,
-                emailVerified: userToVerify.emailVerified,
+                emailVerified: true,
                 createdAt: userToVerify.createdAt
             }
         });
@@ -506,7 +816,7 @@ app.post('/api/resend-verification', async (req, res) => {
             });
         }
 
-        const user = users.get(username);
+        const user = await userRepo.getUserByUsername(username);
         if (!user) {
             return res.status(404).json({
                 success: false,
@@ -530,7 +840,9 @@ app.post('/api/resend-verification', async (req, res) => {
 
         // Generate new verification token
         const newVerificationToken = uuidv4();
-        user.emailVerificationToken = newVerificationToken;
+        await userRepo.updateUser(username, {
+            emailVerificationToken: newVerificationToken
+        });
 
         // Send verification email
         const emailSent = await sendVerificationEmail(user.email, user.username, newVerificationToken);
@@ -573,8 +885,17 @@ app.post('/api/refresh', async (req, res) => {
             });
         }
 
-        const user = users.get(decoded.username);
-        if (!user || !user.refreshTokens.has(refreshToken)) {
+        const user = await userRepo.getUserByUsername(decoded.username);
+        if (!user) {
+            return res.status(403).json({
+                success: false,
+                message: 'Invalid refresh token'
+            });
+        }
+
+        // Check if refresh token exists in DynamoDB
+        const hasToken = await userRepo.hasRefreshToken(decoded.username, refreshToken);
+        if (!hasToken) {
             return res.status(403).json({
                 success: false,
                 message: 'Invalid refresh token'
@@ -595,9 +916,9 @@ app.post('/api/refresh', async (req, res) => {
             { expiresIn: REFRESH_TOKEN_EXPIRES_IN }
         );
 
-        // Remove old refresh token and add new one
-        user.refreshTokens.delete(refreshToken);
-        user.refreshTokens.add(newRefreshToken);
+        // Remove old refresh token and add new one in DynamoDB
+        await userRepo.removeRefreshToken(decoded.username, refreshToken);
+        await userRepo.addRefreshToken(decoded.username, newRefreshToken);
 
         res.json({
             success: true,
@@ -621,13 +942,10 @@ app.post('/api/refresh', async (req, res) => {
     }
 });
 
-app.post('/api/logout', authenticateToken, (req, res) => {
+app.post('/api/logout', authenticateToken, async (req, res) => {
     try {
-        const user = users.get(req.user.username);
-        if (user) {
-            // Clear all refresh tokens for the user
-            user.refreshTokens.clear();
-        }
+        // Clear all refresh tokens for the user in DynamoDB
+        await userRepo.clearRefreshTokens(req.user.username);
 
         res.json({
             success: true,
@@ -643,24 +961,33 @@ app.post('/api/logout', authenticateToken, (req, res) => {
     }
 });
 
-app.get('/api/profile', authenticateToken, (req, res) => {
-    const user = users.get(req.user.username);
-    if (!user) {
-        return res.status(404).json({
+app.get('/api/profile', authenticateToken, async (req, res) => {
+    try {
+        const user = await userRepo.getUserByUsername(req.user.username);
+        if (!user) {
+            return res.status(404).json({
+                success: false,
+                message: 'User not found'
+            });
+        }
+
+        res.json({
+            success: true,
+            user: {
+                id: user.id,
+                username: user.username,
+                email: user.email,
+                createdAt: user.createdAt
+            }
+        });
+    } catch (error) {
+        console.error('Profile error:', error);
+        res.status(500).json({
             success: false,
-            message: 'User not found'
+            message: 'Error fetching profile',
+            error: error.message
         });
     }
-
-    res.json({
-        success: true,
-        user: {
-            id: user.id,
-            username: user.username,
-            email: user.email,
-            createdAt: user.createdAt
-        }
-    });
 });
 
 // Health check
@@ -672,6 +999,152 @@ app.get('/api/health', (req, res) => {
     });
 });
 
+// SQS Endpoints
+
+// Send a message to the SQS queue
+app.post('/api/sqs/send', authenticateToken, async (req, res) => {
+    try {
+        const { message, messageAttributes, delaySeconds } = req.body;
+
+        if (!message) {
+            return res.status(400).json({
+                success: false,
+                message: 'Message body is required'
+            });
+        }
+
+        const result = await sqsHelper.sendMessage(
+            message,
+            messageAttributes || {},
+            delaySeconds || 0
+        );
+
+        res.json({
+            success: true,
+            message: 'Message sent to queue successfully',
+            messageId: result.messageId,
+            md5OfBody: result.md5OfBody
+        });
+    } catch (error) {
+        console.error('SQS send error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to send message to queue',
+            error: error.message
+        });
+    }
+});
+
+// Receive messages from the SQS queue
+app.post('/api/sqs/receive', authenticateToken, async (req, res) => {
+    try {
+        const { maxNumberOfMessages = 1, waitTimeSeconds = 0, visibilityTimeout } = req.body;
+
+        const messages = await sqsHelper.receiveMessages(
+            maxNumberOfMessages,
+            waitTimeSeconds,
+            visibilityTimeout
+        );
+
+        res.json({
+            success: true,
+            messageCount: messages.length,
+            messages: messages
+        });
+    } catch (error) {
+        console.error('SQS receive error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to receive messages from queue',
+            error: error.message
+        });
+    }
+});
+
+// Delete a message from the SQS queue
+app.delete('/api/sqs/message', authenticateToken, async (req, res) => {
+    try {
+        const { receiptHandle } = req.body;
+
+        if (!receiptHandle) {
+            return res.status(400).json({
+                success: false,
+                message: 'Receipt handle is required'
+            });
+        }
+
+        const result = await sqsHelper.deleteMessage(receiptHandle);
+
+        res.json({
+            success: true,
+            message: 'Message deleted successfully'
+        });
+    } catch (error) {
+        console.error('SQS delete error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to delete message',
+            error: error.message
+        });
+    }
+});
+
+// Change message visibility timeout
+app.post('/api/sqs/message/visibility', authenticateToken, async (req, res) => {
+    try {
+        const { receiptHandle, visibilityTimeout } = req.body;
+
+        if (!receiptHandle || visibilityTimeout === undefined) {
+            return res.status(400).json({
+                success: false,
+                message: 'Receipt handle and visibility timeout are required'
+            });
+        }
+
+        const result = await sqsHelper.changeMessageVisibility(receiptHandle, visibilityTimeout);
+
+        res.json({
+            success: true,
+            message: result.message
+        });
+    } catch (error) {
+        console.error('SQS change visibility error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to change message visibility',
+            error: error.message
+        });
+    }
+});
+
+// Get SQS queue information
+app.get('/api/sqs/info', authenticateToken, (req, res) => {
+    try {
+        const queueUrl = sqsHelper.getQueueUrl();
+        
+        if (!queueUrl) {
+            return res.status(404).json({
+                success: false,
+                message: 'SQS queue URL not configured. Please set SQS_QUEUE_URL in environment variables.'
+            });
+        }
+
+        res.json({
+            success: true,
+            queueUrl: queueUrl,
+            region: process.env.AWS_REGION || 'ap-southeast-2',
+            visibilityTimeout: process.env.SQS_VISIBILITY_TIMEOUT || 30
+        });
+    } catch (error) {
+        console.error('SQS info error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Failed to get queue information',
+            error: error.message
+        });
+    }
+});
+
 // Get available filters
 app.get('/api/filters', (req, res) => {
     res.json({
@@ -681,7 +1154,7 @@ app.get('/api/filters', (req, res) => {
     });
 });
 
-// Upload image
+// Upload single image
 app.post('/api/upload', authenticateToken, upload.single('image'), async (req, res) => {
     try {
         if (!req.file) {
@@ -714,6 +1187,66 @@ app.post('/api/upload', authenticateToken, upload.single('image'), async (req, r
         res.status(500).json({
             success: false,
             message: 'Error uploading image',
+            error: error.message
+        });
+    }
+});
+
+// Batch upload multiple images
+app.post('/api/upload/batch', authenticateToken, upload.array('images', 10), async (req, res) => {
+    try {
+        if (!req.files || req.files.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'No image files provided'
+            });
+        }
+
+        const uploadResults = [];
+        
+        for (const file of req.files) {
+            try {
+                const imageId = file.filename.split('.')[0];
+                const originalPath = file.path;
+                const metadata = await sharp(originalPath).metadata();
+
+                uploadResults.push({
+                    success: true,
+                    imageId: imageId,
+                    filename: file.filename,
+                    originalName: file.originalname,
+                    size: file.size,
+                    dimensions: {
+                        width: metadata.width,
+                        height: metadata.height
+                    }
+                });
+            } catch (fileError) {
+                uploadResults.push({
+                    success: false,
+                    filename: file.originalname,
+                    error: fileError.message
+                });
+            }
+        }
+
+        const successCount = uploadResults.filter(r => r.success).length;
+        const failCount = uploadResults.length - successCount;
+
+        res.json({
+            success: true,
+            totalFiles: req.files.length,
+            successCount: successCount,
+            failCount: failCount,
+            results: uploadResults,
+            message: `Uploaded ${successCount} of ${req.files.length} images successfully`
+        });
+
+    } catch (error) {
+        console.error('Batch upload error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error uploading images',
             error: error.message
         });
     }
@@ -757,8 +1290,25 @@ app.post('/api/apply-filter', authenticateToken, async (req, res) => {
         const outputFilename = `${imageId}-${filterName}.png`;
         const outputPath = path.join(processedDir, outputFilename);
 
+        // Check if it's a custom filter
+        let customParams = null;
+        if (filterName.startsWith('custom:')) {
+            const filterId = filterName.replace('custom:', '');
+            const userId = req.user.username;
+            const userFilters = customFilters.get(userId) || {};
+            const customFilter = userFilters[filterId];
+            if (!customFilter) {
+                return res.status(404).json({
+                    success: false,
+                    message: 'Custom filter not found'
+                });
+            }
+            customParams = customFilter.params;
+            filterName = customFilter.name || 'custom';
+        }
+        
         // Apply filter
-        const filteredImage = await applyFilter(inputPath, filterName);
+        const filteredImage = await applyFilter(inputPath, filterName, customParams);
         await filteredImage.png().toFile(outputPath);
 
         // Get processed image metadata
@@ -867,6 +1417,103 @@ app.post('/api/apply-all-filters', authenticateToken, async (req, res) => {
         res.status(500).json({
             success: false,
             message: 'Error processing filters',
+            error: error.message
+        });
+    }
+});
+
+// Batch process multiple images with all filters
+app.post('/api/process/batch', authenticateToken, async (req, res) => {
+    try {
+        const { imageIds, filterNames } = req.body;
+
+        if (!imageIds || !Array.isArray(imageIds) || imageIds.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'Image IDs array is required'
+            });
+        }
+
+        // If filterNames not provided, use all filters
+        const filtersToApply = filterNames && filterNames.length > 0 
+            ? filterNames.filter(f => filters[f]) 
+            : Object.keys(filters);
+
+        if (filtersToApply.length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'No valid filters specified'
+            });
+        }
+
+        const batchResults = [];
+
+        for (const imageId of imageIds) {
+            const uploads = await fs.readdir(uploadsDir);
+            const imageFile = uploads.find(file => file.startsWith(imageId));
+            
+            if (!imageFile) {
+                batchResults.push({
+                    imageId: imageId,
+                    success: false,
+                    error: 'Image not found'
+                });
+                continue;
+            }
+
+            const inputPath = path.join(uploadsDir, imageFile);
+            const imageResults = [];
+
+            for (const filterKey of filtersToApply) {
+                try {
+                    const outputFilename = `${imageId}-${filterKey}.png`;
+                    const outputPath = path.join(processedDir, outputFilename);
+
+                    const filteredImage = await applyFilter(inputPath, filterKey);
+                    await filteredImage.png().toFile(outputPath);
+
+                    const metadata = await sharp(outputPath).metadata();
+
+                    imageResults.push({
+                        filterKey: filterKey,
+                        filterName: filters[filterKey].name,
+                        processedImageUrl: `/api/view/${outputFilename}`,
+                        downloadUrl: `/api/download/${outputFilename}`,
+                        filename: outputFilename,
+                        dimensions: {
+                            width: metadata.width,
+                            height: metadata.height
+                        }
+                    });
+                } catch (filterError) {
+                    imageResults.push({
+                        filterKey: filterKey,
+                        error: filterError.message
+                    });
+                }
+            }
+
+            batchResults.push({
+                imageId: imageId,
+                success: true,
+                results: imageResults,
+                successfulFilters: imageResults.filter(r => !r.error).length
+            });
+        }
+
+        res.json({
+            success: true,
+            totalImages: imageIds.length,
+            processedImages: batchResults.filter(r => r.success).length,
+            results: batchResults,
+            message: `Processed ${batchResults.filter(r => r.success).length} of ${imageIds.length} images`
+        });
+
+    } catch (error) {
+        console.error('Batch processing error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error processing batch',
             error: error.message
         });
     }
@@ -994,6 +1641,471 @@ app.get('/api/download-original/:filename', authenticateToken, async (req, res) 
     }
 });
 
+// Custom Filter Endpoints
+
+// Create or save a custom filter
+app.post('/api/filters/custom', authenticateToken, async (req, res) => {
+    try {
+        const { name, params } = req.body;
+        const userId = req.user.username;
+
+        if (!name || !params) {
+            return res.status(400).json({
+                success: false,
+                message: 'Filter name and parameters are required'
+            });
+        }
+
+        // Validate parameters
+        const validParams = {};
+        if (params.brightness !== undefined) validParams.brightness = parseFloat(params.brightness);
+        if (params.saturation !== undefined) validParams.saturation = parseFloat(params.saturation);
+        if (params.hue !== undefined) validParams.hue = parseFloat(params.hue);
+        if (params.blur !== undefined) validParams.blur = parseFloat(params.blur);
+        if (params.contrast !== undefined) validParams.contrast = parseFloat(params.contrast);
+        if (params.grayscale === true || params.grayscale === 'true') validParams.grayscale = true;
+        if (params.invert === true || params.invert === 'true') validParams.invert = true;
+
+        if (Object.keys(validParams).length === 0) {
+            return res.status(400).json({
+                success: false,
+                message: 'At least one valid parameter is required'
+            });
+        }
+
+        // Store custom filter
+        if (!customFilters.has(userId)) {
+            customFilters.set(userId, {});
+        }
+        const userFilters = customFilters.get(userId);
+        const filterId = uuidv4();
+        userFilters[filterId] = {
+            id: filterId,
+            name: name,
+            params: validParams,
+            createdAt: new Date().toISOString()
+        };
+        customFilters.set(userId, userFilters);
+
+        res.json({
+            success: true,
+            filterId: filterId,
+            filterName: name,
+            filterKey: `custom:${filterId}`,
+            message: 'Custom filter created successfully'
+        });
+
+    } catch (error) {
+        console.error('Custom filter creation error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error creating custom filter',
+            error: error.message
+        });
+    }
+});
+
+// Get user's custom filters
+app.get('/api/filters/custom', authenticateToken, (req, res) => {
+    try {
+        const userId = req.user.username;
+        const userFilters = customFilters.get(userId) || {};
+
+        const filtersList = Object.values(userFilters).map(filter => ({
+            id: filter.id,
+            name: filter.name,
+            filterKey: `custom:${filter.id}`,
+            params: filter.params,
+            createdAt: filter.createdAt
+        }));
+
+        res.json({
+            success: true,
+            filters: filtersList,
+            count: filtersList.length
+        });
+
+    } catch (error) {
+        console.error('Get custom filters error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error fetching custom filters',
+            error: error.message
+        });
+    }
+});
+
+// Apply custom filter directly with parameters (without saving)
+app.post('/api/apply-custom-filter', authenticateToken, async (req, res) => {
+    try {
+        const { imageId, params } = req.body;
+
+        if (!imageId || !params) {
+            return res.status(400).json({
+                success: false,
+                message: 'Image ID and filter parameters are required'
+            });
+        }
+
+        // Find the uploaded image by imageId
+        const uploads = await fs.readdir(uploadsDir);
+        const imageFile = uploads.find(file => file.startsWith(imageId));
+        
+        if (!imageFile) {
+            return res.status(404).json({
+                success: false,
+                message: 'Image not found'
+            });
+        }
+
+        const inputPath = path.join(uploadsDir, imageFile);
+        const outputFilename = `${imageId}-custom-${Date.now()}.png`;
+        const outputPath = path.join(processedDir, outputFilename);
+
+        // Apply custom filter
+        const filteredImage = await applyFilter(inputPath, null, params);
+        await filteredImage.png().toFile(outputPath);
+
+        const metadata = await sharp(outputPath).metadata();
+
+        res.json({
+            success: true,
+            imageId: imageId,
+            processedImageUrl: `/api/view/${outputFilename}`,
+            downloadUrl: `/api/download/${outputFilename}`,
+            filename: outputFilename,
+            originalImageUrl: `/api/view-original/${imageFile}`,
+            dimensions: {
+                width: metadata.width,
+                height: metadata.height
+            },
+            message: 'Custom filter applied successfully'
+        });
+
+    } catch (error) {
+        console.error('Custom filter application error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error applying custom filter',
+            error: error.message
+        });
+    }
+});
+
+// Image comparison endpoint - returns both original and filtered image URLs
+app.get('/api/compare/:imageId/:filterName', authenticateToken, async (req, res) => {
+    try {
+        const { imageId, filterName } = req.params;
+
+        // Find the uploaded image
+        const uploads = await fs.readdir(uploadsDir);
+        const imageFile = uploads.find(file => file.startsWith(imageId));
+        
+        if (!imageFile) {
+            return res.status(404).json({
+                success: false,
+                message: 'Image not found'
+            });
+        }
+
+        const originalImageUrl = `/api/view-original/${imageFile}`;
+        let filteredImageUrl = null;
+        let processedFilename = null;
+
+        // If filter is specified, find or create the filtered version
+        if (filterName && filterName !== 'none') {
+            const outputFilename = `${imageId}-${filterName}.png`;
+            const outputPath = path.join(processedDir, outputFilename);
+            
+            // Check if filtered version exists, if not create it
+            if (!await fs.pathExists(outputPath)) {
+                // Apply filter if it doesn't exist
+                const inputPath = path.join(uploadsDir, imageFile);
+                let customParams = null;
+                
+                if (filterName.startsWith('custom:')) {
+                    const filterId = filterName.replace('custom:', '');
+                    const userId = req.user.username;
+                    const userFilters = customFilters.get(userId) || {};
+                    const customFilter = userFilters[filterId];
+                    if (customFilter) {
+                        customParams = customFilter.params;
+                    }
+                }
+                
+                const filteredImage = await applyFilter(inputPath, filterName, customParams);
+                await filteredImage.png().toFile(outputPath);
+            }
+            
+            filteredImageUrl = `/api/view/${outputFilename}`;
+            processedFilename = outputFilename;
+        }
+
+        res.json({
+            success: true,
+            imageId: imageId,
+            originalImageUrl: originalImageUrl,
+            filteredImageUrl: filteredImageUrl,
+            processedFilename: processedFilename,
+            filterName: filterName === 'none' ? null : filterName
+        });
+
+    } catch (error) {
+        console.error('Image comparison error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error getting image comparison',
+            error: error.message
+        });
+    }
+});
+
+// View original image (for comparison)
+app.get('/api/view-original/:filename', authenticateToken, async (req, res) => {
+    try {
+        const filename = req.params.filename;
+        const filePath = path.join(uploadsDir, filename);
+
+        if (!await fs.pathExists(filePath)) {
+            return res.status(404).json({
+                success: false,
+                message: 'File not found'
+            });
+        }
+
+        // Determine content type from file extension
+        const ext = path.extname(filename).toLowerCase();
+        const contentType = ext === '.jpg' || ext === '.jpeg' ? 'image/jpeg' :
+                           ext === '.png' ? 'image/png' :
+                           ext === '.gif' ? 'image/gif' : 'image/jpeg';
+
+        res.setHeader('Content-Type', contentType);
+        res.sendFile(filePath);
+
+    } catch (error) {
+        console.error('View original error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error viewing original file',
+            error: error.message
+        });
+    }
+});
+
+// Image Sharing Endpoints
+
+// Generate a shareable link for a processed image
+app.post('/api/share', authenticateToken, async (req, res) => {
+    try {
+        const { imageId, filterName, expiresInHours = 24 } = req.body;
+        const userId = req.user.username;
+
+        if (!imageId || !filterName) {
+            return res.status(400).json({
+                success: false,
+                message: 'Image ID and filter name are required'
+            });
+        }
+
+        // Find the processed image
+        const processed = await fs.readdir(processedDir);
+        const filename = processed.find(file => 
+            file.startsWith(imageId) && file.includes(filterName)
+        );
+
+        if (!filename) {
+            return res.status(404).json({
+                success: false,
+                message: 'Processed image not found'
+            });
+        }
+
+        // Generate share token
+        const shareToken = uuidv4();
+        const expiresAt = new Date(Date.now() + (expiresInHours * 60 * 60 * 1000));
+
+        sharedImages.set(shareToken, {
+            imageId,
+            filename,
+            filterName,
+            userId,
+            expiresAt: expiresAt.toISOString(),
+            createdAt: new Date().toISOString()
+        });
+
+        const shareUrl = `${BASE_URL}/api/shared/${shareToken}`;
+
+        res.json({
+            success: true,
+            shareToken: shareToken,
+            shareUrl: shareUrl,
+            expiresAt: expiresAt.toISOString(),
+            message: 'Shareable link created successfully'
+        });
+
+    } catch (error) {
+        console.error('Share creation error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error creating shareable link',
+            error: error.message
+        });
+    }
+});
+
+// Access shared image (no authentication required)
+app.get('/api/shared/:token', async (req, res) => {
+    try {
+        const { token } = req.params;
+        const sharedImage = sharedImages.get(token);
+
+        if (!sharedImage) {
+            return res.status(404).json({
+                success: false,
+                message: 'Shared link not found or expired'
+            });
+        }
+
+        // Check if expired
+        if (new Date(sharedImage.expiresAt) < new Date()) {
+            sharedImages.delete(token);
+            return res.status(410).json({
+                success: false,
+                message: 'Shared link has expired'
+            });
+        }
+
+        const filePath = path.join(processedDir, sharedImage.filename);
+
+        if (!await fs.pathExists(filePath)) {
+            return res.status(404).json({
+                success: false,
+                message: 'Image file not found'
+            });
+        }
+
+        res.setHeader('Content-Type', 'image/png');
+        res.sendFile(filePath);
+
+    } catch (error) {
+        console.error('Shared image access error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error accessing shared image',
+            error: error.message
+        });
+    }
+});
+
+// Background Processing with SQS
+
+// Queue image processing job
+app.post('/api/process/queue', authenticateToken, async (req, res) => {
+    try {
+        const { imageId, filterNames, useSQS = true } = req.body;
+        const userId = req.user.username;
+
+        if (!imageId) {
+            return res.status(400).json({
+                success: false,
+                message: 'Image ID is required'
+            });
+        }
+
+        // Verify image exists
+        const uploads = await fs.readdir(uploadsDir);
+        const imageFile = uploads.find(file => file.startsWith(imageId));
+        
+        if (!imageFile) {
+            return res.status(404).json({
+                success: false,
+                message: 'Image not found'
+            });
+        }
+
+        if (useSQS && QUEUE_URL) {
+            // Queue the job via SQS
+            const jobId = uuidv4();
+            const jobMessage = {
+                jobId: jobId,
+                userId: userId,
+                imageId: imageId,
+                imageFile: imageFile,
+                filterNames: filterNames || Object.keys(filters),
+                createdAt: new Date().toISOString()
+            };
+
+            await sqsHelper.sendMessage(
+                JSON.stringify(jobMessage),
+                {
+                    jobType: 'image_processing',
+                    userId: userId,
+                    imageId: imageId
+                }
+            );
+
+            res.json({
+                success: true,
+                jobId: jobId,
+                message: 'Processing job queued successfully',
+                queued: true,
+                estimatedCompletion: 'Processing in background'
+            });
+        } else {
+            // Process synchronously if SQS not available
+            const filtersToApply = filterNames && filterNames.length > 0 
+                ? filterNames.filter(f => filters[f]) 
+                : Object.keys(filters);
+
+            const inputPath = path.join(uploadsDir, imageFile);
+            const results = [];
+
+            for (const filterKey of filtersToApply) {
+                try {
+                    const outputFilename = `${imageId}-${filterKey}.png`;
+                    const outputPath = path.join(processedDir, outputFilename);
+                    const filteredImage = await applyFilter(inputPath, filterKey);
+                    await filteredImage.png().toFile(outputPath);
+
+                    const metadata = await sharp(outputPath).metadata();
+                    results.push({
+                        filterKey: filterKey,
+                        filterName: filters[filterKey].name,
+                        processedImageUrl: `/api/view/${outputFilename}`,
+                        downloadUrl: `/api/download/${outputFilename}`,
+                        filename: outputFilename,
+                        dimensions: {
+                            width: metadata.width,
+                            height: metadata.height
+                        }
+                    });
+                } catch (filterError) {
+                    results.push({
+                        filterKey: filterKey,
+                        error: filterError.message
+                    });
+                }
+            }
+
+            res.json({
+                success: true,
+                imageId: imageId,
+                results: results,
+                queued: false,
+                message: 'Processing completed'
+            });
+        }
+
+    } catch (error) {
+        console.error('Queue processing error:', error);
+        res.status(500).json({
+            success: false,
+            message: 'Error queueing processing job',
+            error: error.message
+        });
+    }
+});
+
 // Clean up old files (optional endpoint)
 app.delete('/api/cleanup', async (req, res) => {
     try {
@@ -1079,7 +2191,23 @@ app.use('*', (req, res) => {
 
 // Start server
 app.listen(PORT, async () => {
-    await initializeDefaultUser();
+    try {
+        // Ensure DynamoDB table exists
+        console.log('⏳ Checking DynamoDB table...');
+        await userRepo.ensureTableExists();
+        
+        // Initialize default user
+        await initializeDefaultUser();
+    } catch (error) {
+        if (error.name === 'UnrecognizedClientException' || error.message.includes('security token')) {
+            console.error('❌ AWS session token has expired or is invalid.');
+            console.error('   Please update your AWS credentials in .aws/credentials');
+            console.error('   Get fresh credentials from AWS Console or your instructor.');
+        } else {
+            console.error('❌ Error during startup:', error.message);
+            console.error('Make sure AWS credentials are configured and the DynamoDB table can be created.');
+        }
+    }
     
     console.log(`🚀 PhotoFilter Pro API server running on port ${PORT}`);
     console.log(`📁 Uploads directory: ${uploadsDir}`);
@@ -1087,8 +2215,14 @@ app.listen(PORT, async () => {
     console.log(`🌐 API Base URL: http://localhost:${PORT}/api`);
     console.log(`🔐 JWT Authentication: Enabled`);
     console.log(`📖 Available endpoints:`);
-    console.log(`   POST /api/register - User registration`);
-    console.log(`   POST /api/login - User login`);
+    if (cognito) {
+        console.log(`   POST /api/cognito/signup - Cognito signup`);
+        console.log(`   POST /api/cognito/confirm - Cognito email confirmation`);
+        console.log(`   POST /api/cognito/login - Cognito login`);
+        console.log(`   POST /api/cognito/resend-code - Resend confirmation code`);
+    }
+    console.log(`   POST /api/register - User registration (Legacy)`);
+    console.log(`   POST /api/login - User login (Legacy)`);
     console.log(`   GET  /api/verify-email - Email verification`);
     console.log(`   POST /api/resend-verification - Resend verification email`);
     console.log(`   POST /api/refresh - Refresh access token`);
@@ -1096,14 +2230,30 @@ app.listen(PORT, async () => {
     console.log(`   GET  /api/profile - Get user profile`);
     console.log(`   GET  /api/health - Health check`);
     console.log(`   GET  /api/filters - Get available filters`);
-    console.log(`   POST /api/upload - Upload image (🔒)`);
+    console.log(`   POST /api/upload - Upload single image (🔒)`);
+    console.log(`   POST /api/upload/batch - Batch upload multiple images (🔒)`);
     console.log(`   POST /api/apply-filter - Apply single filter (🔒)`);
     console.log(`   POST /api/apply-all-filters - Apply all filters (🔒)`);
+    console.log(`   POST /api/process/batch - Batch process multiple images (🔒)`);
     console.log(`   GET  /api/view/:filename - View processed image (🔒)`);
+    console.log(`   GET  /api/view-original/:filename - View original image (🔒)`);
     console.log(`   GET  /api/download/:filename - Download processed image (🔒)`);
     console.log(`   GET  /api/image/:imageId - Get image info (🔒)`);
     console.log(`   GET  /api/download-original/:filename - Download original image (🔒)`);
+    console.log(`   GET  /api/compare/:imageId/:filterName - Compare original vs filtered (🔒)`);
+    console.log(`   POST /api/filters/custom - Create custom filter (🔒)`);
+    console.log(`   GET  /api/filters/custom - Get user's custom filters (🔒)`);
+    console.log(`   POST /api/apply-custom-filter - Apply custom filter directly (🔒)`);
+    console.log(`   POST /api/share - Generate shareable link (🔒)`);
+    console.log(`   GET  /api/shared/:token - Access shared image (public)`);
+    console.log(`   POST /api/process/queue - Queue background processing job (🔒)`);
     console.log(`   DELETE /api/cleanup - Clean up old files`);
+    console.log(`\n📬 SQS Endpoints:`);
+    console.log(`   POST /api/sqs/send - Send message to queue (🔒)`);
+    console.log(`   POST /api/sqs/receive - Receive messages from queue (🔒)`);
+    console.log(`   DELETE /api/sqs/message - Delete message from queue (🔒)`);
+    console.log(`   POST /api/sqs/message/visibility - Change message visibility timeout (🔒)`);
+    console.log(`   GET  /api/sqs/info - Get queue information (🔒)`);
     console.log(`\n🔑 Default user: anter / kingkong`);
 });
 

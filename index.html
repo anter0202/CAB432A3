@@ -52,7 +52,10 @@
                         </div>
                         <div class="form-group">
                             <i class="fas fa-lock"></i>
-                            <input type="password" id="regPassword" placeholder="Password" required>
+                            <input type="password" id="regPassword" placeholder="Password (8+ chars, 1 upper, 1 lower, 1 number, 1 symbol)" required>
+                            <small style="color: #666; font-size: 0.85em; margin-top: 5px; display: block;">
+                                Password must contain: 8+ characters, 1 uppercase, 1 lowercase, 1 number, 1 symbol
+                            </small>
                         </div>
                         <button type="submit" class="login-btn">
                             <i class="fas fa-user-plus"></i>
@@ -112,9 +115,31 @@
                         <h3>Upload Photo</h3>
                         <p>Drag & drop or click to select</p>
                         <input type="file" id="fileInput" accept="image/*" hidden>
-                        <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
-                            Choose File
-                        </button>
+                        <input type="file" id="batchFileInput" accept="image/*" multiple hidden>
+                        <div class="upload-buttons">
+                            <button class="upload-btn" onclick="document.getElementById('fileInput').click()">
+                                <i class="fas fa-upload"></i> Single Upload
+                            </button>
+                            <button class="upload-btn batch" id="batchUploadButton" onclick="
+                                const input = document.getElementById('batchFileInput');
+                                if (input) {
+                                    input.setAttribute('multiple', 'multiple');
+                                    input.click();
+                                }
+                            ">
+                                <i class="fas fa-layer-group"></i> Batch Upload
+                            </button>
+                        </div>
+                        <div id="batchFileList" style="margin-top: 15px; display: none;">
+                            <p id="batchFileCount" style="font-size: 0.9em; color: #666; font-weight: 500;"></p>
+                            <p style="font-size: 0.8em; color: #999; margin-top: 5px;">Maximum 10 images • Click "Batch Upload" again to change selection</p>
+                        </div>
+                        <p id="batchHelpText" style="font-size: 0.85em; color: #667eea; margin-top: 10px; font-weight: 500; display: block; background: #e3f2fd; padding: 10px; border-radius: 5px; margin-top: 15px;">
+                            <strong>📌 How to select multiple files:</strong><br>
+                            • Hold <strong>Ctrl</strong> and click each file you want<br>
+                            • Or hold <strong>Shift</strong> and click first and last file for a range<br>
+                            • Or drag multiple files from File Explorer into the upload area
+                        </p>
                     </div>
                 </div>
                 
@@ -122,6 +147,14 @@
                     <button id="cameraBtn" class="camera-btn">
                         <i class="fas fa-camera"></i>
                         Take Photo
+                    </button>
+                    <button id="customFilterBtn" class="camera-btn" style="background: #ff9800;">
+                        <i class="fas fa-sliders-h"></i>
+                        Custom Filter
+                    </button>
+                    <button id="compareModeBtn" class="camera-btn" style="background: #2196F3; display: none;">
+                        <i class="fas fa-columns"></i>
+                        Compare
                     </button>
                     <video id="video" autoplay muted hidden></video>
                     <canvas id="canvas" hidden></canvas>
@@ -140,6 +173,16 @@
                         <div class="progress-info" id="progressInfo">
                             <p>Step 1: Uploading image...</p>
                         </div>
+                        <div style="display: flex; gap: 10px; justify-content: center; margin-top: 20px;">
+                            <button id="customFilterBtnProcessing" class="action-btn" style="display: none; background: #ff9800; cursor: pointer;">
+                                <i class="fas fa-sliders-h"></i>
+                                Create Custom Filter
+                            </button>
+                            <button id="cancelProcessingBtn" class="action-btn cancel" style="display: none; background: #dc3545; cursor: pointer;">
+                                <i class="fas fa-times"></i>
+                                Cancel & Return
+                            </button>
+                        </div>
                     </div>
                 </div>
                 
@@ -150,9 +193,17 @@
                     </div>
                     
                     <div class="action-buttons">
+                        <button id="shareBtn" class="action-btn share" disabled>
+                            <i class="fas fa-share-alt"></i>
+                            Share
+                        </button>
                         <button id="downloadBtn" class="action-btn download" disabled>
                             <i class="fas fa-download"></i>
                             Download Selected
+                        </button>
+                        <button id="customFilterBtnResults" class="action-btn" style="background: #ff9800;">
+                            <i class="fas fa-sliders-h"></i>
+                            Custom Filter
                         </button>
                         <button id="newPhotoBtn" class="action-btn new">
                             <i class="fas fa-plus"></i>
@@ -160,10 +211,99 @@
                         </button>
                     </div>
                 </div>
+                
+                <!-- Image Comparison View -->
+                <div class="comparison-section" id="comparisonSection" style="display: none;">
+                    <h3 class="results-title">Before & After Comparison</h3>
+                    <div class="comparison-container">
+                        <div class="comparison-image">
+                            <p class="comparison-label">Original</p>
+                            <img id="originalImage" src="" alt="Original">
+                        </div>
+                        <div class="comparison-divider">
+                            <i class="fas fa-arrows-alt-h"></i>
+                        </div>
+                        <div class="comparison-image">
+                            <p class="comparison-label">Filtered</p>
+                            <img id="filteredImage" src="" alt="Filtered">
+                        </div>
+                    </div>
+                    <div class="action-buttons">
+                        <button id="closeComparisonBtn" class="action-btn new">
+                            <i class="fas fa-times"></i>
+                            Close
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Custom Filter Creator -->
+                <div class="custom-filter-section" id="customFilterSection" style="display: none;">
+                    <h3 class="results-title">Create Custom Filter</h3>
+                    <div class="filter-controls">
+                        <div class="filter-control-group">
+                            <label>Filter Name:</label>
+                            <input type="text" id="customFilterName" placeholder="My Custom Filter">
+                        </div>
+                        <div class="filter-control-group">
+                            <label>Brightness: <span id="brightnessValue">1.0</span></label>
+                            <input type="range" id="brightnessSlider" min="0.1" max="3.0" step="0.1" value="1.0">
+                        </div>
+                        <div class="filter-control-group">
+                            <label>Saturation: <span id="saturationValue">1.0</span></label>
+                            <input type="range" id="saturationSlider" min="0" max="3.0" step="0.1" value="1.0">
+                        </div>
+                        <div class="filter-control-group">
+                            <label>Hue: <span id="hueValue">0</span>°</label>
+                            <input type="range" id="hueSlider" min="-180" max="180" step="1" value="0">
+                        </div>
+                        <div class="filter-control-group">
+                            <label>Blur: <span id="blurValue">0</span></label>
+                            <input type="range" id="blurSlider" min="0" max="10" step="0.5" value="0">
+                        </div>
+                        <div class="filter-control-group">
+                            <label>Contrast: <span id="contrastValue">1.0</span></label>
+                            <input type="range" id="contrastSlider" min="0.5" max="3.0" step="0.1" value="1.0">
+                        </div>
+                        <div class="filter-control-group checkbox">
+                            <label>
+                                <input type="checkbox" id="grayscaleCheck">
+                                Grayscale
+                            </label>
+                            <label>
+                                <input type="checkbox" id="invertCheck">
+                                Invert
+                            </label>
+                        </div>
+                    </div>
+                    <div class="action-buttons">
+                        <button id="previewCustomBtn" class="action-btn" style="background: #2196F3;">
+                            <i class="fas fa-eye"></i>
+                            Preview
+                        </button>
+                        <button id="saveCustomBtn" class="action-btn" style="background: #4CAF50;">
+                            <i class="fas fa-save"></i>
+                            Save Filter
+                        </button>
+                        <button id="cancelCustomBtn" class="action-btn new">
+                            <i class="fas fa-times"></i>
+                            Cancel
+                        </button>
+                    </div>
+                </div>
+                
+                <!-- Queue Status -->
+                <div class="queue-status" id="queueStatus" style="display: none;">
+                    <div class="queue-content">
+                        <i class="fas fa-tasks"></i>
+                        <h4>Background Processing</h4>
+                        <p id="queueMessage">Job queued successfully</p>
+                        <div class="queue-info" id="queueInfo"></div>
+                    </div>
+                </div>
             </div>
         </main>
     </div>
 
-    <script src="api-script.js"></script>
+    <script src="api-script.js?v=7"></script>
 </body>
 </html>
